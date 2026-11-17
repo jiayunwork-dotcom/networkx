@@ -84,6 +84,33 @@ Measuring partitions
    modularity
    partition_quality
 
+Signed networks
+---------------
+Networks whose edges carry both positive (support) and negative
+(rejection) weights can be analyzed directly, without summing the two
+kinds of evidence away.  ``modularity``, ``louvain_partitions``,
+``louvain_communities`` and ``greedy_modularity_communities`` all accept
+a keyword-only ``signed=True`` argument (undirected graphs only).  Each
+edge weight is then split into a positive layer and a negative layer and
+the partition is scored by the two-layer signed modularity
+
+.. math::
+
+   Q_{signed} = \frac{m^+ Q^+ - m^- Q^-}{m^+ + m^-}
+
+where :math:`m^+`, :math:`m^-` are the total edge masses of the two
+layers and :math:`Q^+`, :math:`Q^-` are the usual modularities of the
+partition computed on each layer with the same ``resolution``.  The
+score rewards communities that concentrate supportive edges while
+keeping rejecting edges between communities; graphs with only positive
+weights degenerate to the usual modularity.  Both optimizers consider
+pairs of nodes and communities that have no edges between them, because
+shared rejection is itself evidence for grouping.  See the ``signed``
+parameter in :func:`community.modularity`,
+:func:`community.louvain_communities`,
+:func:`community.louvain_partitions` and
+:func:`community.greedy_modularity_communities`.
+
 Partitions via centrality measures
 ----------------------------------
 .. automodule:: networkx.algorithms.community.centrality

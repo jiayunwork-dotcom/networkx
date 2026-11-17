@@ -1,8 +1,15 @@
 """Functions for detecting communities based on modularity."""
 
+import math
 from collections import defaultdict
 
 import networkx as nx
+from networkx.algorithms.community import _signed
+from networkx.algorithms.community._signed import (
+    _check_signed_graph,
+    _signed_layer_data,
+    _validate_signed_resolution,
+)
 from networkx.algorithms.community.quality import modularity
 from networkx.utils import not_implemented_for
 from networkx.utils.mapped_queue import MappedQueue
@@ -230,6 +237,8 @@ def greedy_modularity_communities(
     resolution=1,
     cutoff=1,
     best_n=None,
+    *,
+    signed=False,
 ):
     r"""Find communities in G using greedy modularity maximization.
 
@@ -275,10 +284,29 @@ def greedy_modularity_communities(
         starts to decrease until `best_n` communities remain.
         If ``None``, don't force it to continue beyond a maximum.
 
+    signed : bool, optional (default=False)
+        If True, maximize the signed two-layer modularity (see
+        :func:`~networkx.algorithms.community.quality.modularity`) where
+        negative edge weights repel communities. Only implemented for
+        undirected graphs. In signed mode every pair of communities is a
+        merge candidate -- including pairs with no edges between them,
+        which can still have positive gain -- and merging stops when no
+        merge gain exceeds 1e-12 (unless `best_n` forces it to continue,
+        in which case the largest-gain merge is still chosen).
+
     Raises
     ------
     ValueError : If the `cutoff` or `best_n`  value is not in the range
         ``[1, G.number_of_nodes()]``, or if `best_n` < `cutoff`.
+
+    NetworkXNotImplemented
+        If `signed` is True and `G` is directed.
+
+    ValueError
+        If `signed` is True and a weight or `resolution` is not a finite
+        real number (weights must also not be boolean), if `resolution`
+        is negative, or if an accumulated layer mass overflows the
+        floating-point range.
 
     Returns
     -------
@@ -309,6 +337,9 @@ def greedy_modularity_communities(
     .. [4] Newman, M. E. J."Analysis of weighted networks"
        Physical Review E 70(5 Pt 2):056131, 2004.
     """
+    if signed:
+        return _greedy_modularity_signed(G, weight, resolution, cutoff, best_n)
+
     if not G.size():
         return [{n} for n in G]
 
@@ -352,6 +383,361 @@ def greedy_modularity_communities(
         communities = next(community_gen)
 
     return sorted(communities, key=len, reverse=True)
+
+
+def _greedy_modularity_signed(G, weight, resolution, cutoff, best_n):
+    """Find communities in ``G`` using greedy signed-modularity maximization.
+
+    This is the ``signed=True`` path of
+    :func:`greedy_modularity_communities`; see its docstring for the
+    scoring convention and parameter semantics.
+    """
+    _check_signed_graph(G)
+    resolution = _validate_signed_resolution(resolution)
+    N = G.number_of_nodes()
+    if N == 0:
+        return []
+
+    if (cutoff < 1) or (cutoff > N):
+        raise ValueError(f"cutoff must be between 1 and {N}. Got {cutoff}.")
+    if best_n is not None:
+        if (best_n < 1) or (best_n > N):
+            raise ValueError(f"best_n must be between 1 and {N}. Got {best_n}.")
+        if best_n < cutoff:
+            raise ValueError(f"Must have best_n >= cutoff. Got {best_n} < {cutoff}")
+    else:
+        best_n = N
+
+    # validate all weights and accumulate the two layer masses/degrees
+    m_pos, m_neg, deg_pos, deg_neg = _signed_layer_data(G, weight)
+
+    if best_n == 1:
+        return [set(G)]
+
+    # retrieve generator object to construct output
+    community_gen = _greedy_modularity_signed_generator(
+        G, weight, resolution, m_pos, m_neg, deg_pos, deg_neg
+    )
+
+    # construct the first best community
+    communities = next(community_gen)
+
+    # continue merging communities until one of the breaking criteria is
+    # satisfied
+    while len(communities) > cutoff:
+        try:
+            dq = next(community_gen)
+        # StopIteration occurs when a single community remains
+        except StopIteration:
+            break
+
+        # keep going unless the gain threshold is reached or best_n says
+        # to merge more
+        if dq <= 1e-12 and len(communities) <= best_n:
+            break
+        communities = next(community_gen)
+
+    return sorted(communities, key=len, reverse=True)
+
+
+def _greedy_modularity_signed_generator(
+    G, weight, resolution, m_pos, m_neg, deg_pos, deg_neg
+):
+    r"""Yield partitions and signed-modularity changes at each merge step.
+
+    Clauset-Newman-Moore greedy maximization of the signed two-layer
+    modularity (see :func:`greedy_modularity_communities` with
+    ``signed=True``).  ``m_pos``/``m_neg`` and ``deg_pos``/``deg_neg`` are
+    the validated layer masses and per-node layer degrees from
+    :func:`~networkx.algorithms.community._signed._signed_layer_data`.
+
+    The gain of merging communities ``u`` and ``v`` is
+
+        dq(u, v) = w(u, v) / m_tot
+                   - a_pos * K_pos_u * K_pos_v + a_neg * K_neg_u * K_neg_v
+
+    where ``w(u, v)`` is the net (positive minus negative) weight between
+    the communities, ``K_pos``/``K_neg`` are the community layer-degree
+    sums, ``m_tot = m_pos + m_neg`` and ``a_pos = gamma / (2 m_pos
+    m_tot)``, ``a_neg = gamma / (2 m_neg m_tot)`` (a layer term is dropped
+    when its mass is zero; all gains are 0 when both are zero).
+
+    Candidate coverage: adjacent community pairs are tracked with the
+    usual CNM per-row heaps (``dq_dict``/``dq_heap``/``H``, memory
+    proportional to the number of inter-community edges).  Pairs with no
+    edges between them can still have positive gain in signed networks
+    (their gain depends only on the two communities' degree sums), so
+    each community additionally caches its best non-adjacent partner in
+    ``na_best`` (one entry per community, no all-pairs gain table) with
+    the global maxima in ``na_H``.  Entries of ``na_best`` are either
+    exact or lazy upper bounds; upper bounds are recomputed exactly (an
+    O(#communities) scan) only when they reach the root of ``na_H`` and
+    can still beat the best adjacent-pair gain, which keeps the number
+    of exact evaluations small without ever missing the best pair.
+
+    Yields
+    ------
+    Alternating yield statements produce the following two objects:
+
+    communities: dict_values
+        A dict_values of frozensets of nodes, one for each community.
+        The first yield is the partition with each node in its own
+        community.
+
+    dq: float
+        The change in signed modularity when merging the next two
+        communities that leads to the largest signed modularity.
+    """
+    stats = _signed._EVAL_STATS
+    nodes = list(G)
+    N = len(nodes)
+    node_idx = {u: i for i, u in enumerate(nodes)}
+    m_tot = m_pos + m_neg
+    inv_mtot = 1.0 / m_tot if m_tot else 0.0
+    a_pos = resolution / (2 * m_pos * m_tot) if m_pos else 0.0
+    a_neg = resolution / (2 * m_neg * m_tot) if m_neg else 0.0
+
+    # community id == index into these lists; communities are keyed by
+    # integers so that no ordering of the (possibly unorderable) nodes is
+    # ever needed
+    k_pos = [0.0] * N
+    k_neg = [0.0] * N
+    for u, i in node_idx.items():
+        k_pos[i] = deg_pos[u]
+        k_neg[i] = deg_neg[u]
+
+    # net weight per adjacent community pair (both directions); the two
+    # layers enter the gain through this net weight and, separately,
+    # through the layer degrees and masses above
+    dq_dict = defaultdict(lambda: defaultdict(float))
+    for u, v, w in G.edges(data=weight, default=1):
+        if u == v:
+            continue
+        w = float(w)  # already validated by _signed_layer_data
+        if w == 0:
+            continue
+        i, j = node_idx[u], node_idx[v]
+        dq_dict[i][j] += w
+        dq_dict[j][i] += w
+    # convert net weights into gains
+    for i, nbrdict in dq_dict.items():
+        kpi, kni = k_pos[i], k_neg[i]
+        for j, w in nbrdict.items():
+            nbrdict[j] = w * inv_mtot - a_pos * kpi * k_pos[j] + a_neg * kni * k_neg[j]
+
+    # per-row heaps of adjacent-pair gains, plus a heap of row maxima
+    dq_heap = {
+        i: MappedQueue({(i, j): -dq for j, dq in dq_dict[i].items()})
+        if i in dq_dict
+        else MappedQueue()
+        for i in range(N)
+    }
+    H = MappedQueue()
+    for i in range(N):
+        if len(dq_heap[i]) > 0:
+            H.push(i, priority=dq_heap[i].heap[0].priority)
+
+    communities = {i: frozenset([nodes[i]]) for i in range(N)}
+
+    # Non-adjacent candidates.  na_best[c] = [value, partner, exact]:
+    # ``value`` is either the exact best gain of community ``c`` over its
+    # non-adjacent partners (exact=True) or an upper bound on it
+    # (exact=False).  na_H is keyed by -value, so its root is the largest
+    # exact gain or upper bound.  Stale (upper-bound) entries are
+    # recomputed exactly only when they reach the root and can still beat
+    # the best adjacent-pair gain; recomputation is an O(#communities)
+    # scan.  This keeps memory at one entry per community (no all-pairs
+    # gain table) and avoids most exact evaluations, at the price of
+    # occasionally recomputing a best partner from scratch.
+    na_best = {}
+    na_H = MappedQueue()
+
+    def heap_set(q, elt, priority):
+        """Push or update ``elt`` in a MappedQueue."""
+        try:
+            q.update(elt, elt, priority=priority)
+        except KeyError:
+            q.push(elt, priority=priority)
+
+    def heap_discard(q, elt):
+        """Remove ``elt`` from a MappedQueue if present."""
+        try:
+            q.remove(elt)
+        except KeyError:
+            pass
+
+    def row_sync(i):
+        """Reflect row ``i`` of the adjacent-pair heaps in the max heap H."""
+        if len(dq_heap[i]) > 0:
+            heap_set(H, i, dq_heap[i].heap[0].priority)
+        else:
+            heap_discard(H, i)
+
+    def na_set(c, value, partner, exact):
+        na_best[c] = [value, partner, exact]
+        heap_set(na_H, c, -value)
+
+    def na_drop(c):
+        na_best.pop(c, None)
+        heap_discard(na_H, c)
+
+    def gain_na(c, d):
+        return a_neg * k_neg[c] * k_neg[d] - a_pos * k_pos[c] * k_pos[d]
+
+    def na_rescan(c):
+        """Recompute the best non-adjacent partner of community ``c``."""
+        adj = dq_dict.get(c)
+        kpc = k_pos[c]
+        knc = k_neg[c]
+        best_g = None
+        best_d = -1
+        n_evals = 0
+        for d in communities:
+            if d == c or (adj is not None and d in adj):
+                continue
+            n_evals += 1
+            g = a_neg * knc * k_neg[d] - a_pos * kpc * k_pos[d]
+            if best_g is None or g > best_g:
+                best_g = g
+                best_d = d
+        if stats is not None:
+            stats["greedy_na_gain_evals"] += n_evals
+        if best_g is None:
+            na_drop(c)
+        else:
+            na_set(c, best_g, best_d, True)
+
+    def merge(u, v):
+        """Merge community ``u`` into community ``v``."""
+        nonlocal kn_max
+        # --- update the adjacent-pair gains (CNM-style) ---
+        u_nbrs = dq_dict.get(u, {})
+        v_nbrs = dq_dict[v]  # auto-creates the row if v had no neighbors
+        if v in u_nbrs:
+            # remove the merged pair itself
+            del u_nbrs[v]
+            del v_nbrs[u]
+            dq_heap[u].remove((u, v))
+            dq_heap[v].remove((v, u))
+        kpu, knu = k_pos[u], k_neg[u]
+        kpv, knv = k_pos[v], k_neg[v]
+        n_evals = 0
+        for w in set(u_nbrs) | set(v_nbrs):
+            in_u = w in u_nbrs
+            in_v = w in v_nbrs
+            if in_u and in_v:
+                dq_vw = v_nbrs[w] + u_nbrs[w]
+            elif in_u:
+                # dq(u, w) - phi(v, w) with pre-merge degrees of v
+                dq_vw = u_nbrs[w] - (a_pos * kpv * k_pos[w] - a_neg * knv * k_neg[w])
+            else:
+                # dq(v, w) - phi(u, w)
+                dq_vw = v_nbrs[w] - (a_pos * kpu * k_pos[w] - a_neg * knu * k_neg[w])
+            n_evals += 1
+            # write the new gain into rows v and w
+            v_nbrs[w] = dq_vw
+            dq_dict[w][v] = dq_vw
+            heap_set(dq_heap[v], (v, w), -dq_vw)
+            heap_set(dq_heap[w], (w, v), -dq_vw)
+            if in_u:
+                del u_nbrs[w]
+                del dq_dict[w][u]
+                heap_discard(dq_heap[w], (w, u))
+            row_sync(w)
+        if stats is not None:
+            stats["greedy_merge_gain_evals"] += n_evals
+        # remove row u entirely
+        dq_dict.pop(u, None)
+        dq_heap[u] = MappedQueue()
+        heap_discard(H, u)
+        row_sync(v)
+        # --- layer degrees of the merged community ---
+        k_pos[v] = kpv + kpu
+        k_neg[v] = knv + knu
+        k_pos[u] = 0.0
+        k_neg[u] = 0.0
+        if k_neg[v] > kn_max:
+            kn_max = k_neg[v]
+        # --- the merged community set ---
+        communities[v] = communities[u] | communities[v]
+        del communities[u]
+        # --- refresh the non-adjacent candidates (lazily) ---
+        na_drop(u)
+        # v's own best partner is recomputed lazily from an upper bound
+        na_set(v, a_neg * k_neg[v] * kn_max, None, False)
+        for c in communities:
+            if c == v:
+                continue
+            entry = na_best.get(c)
+            if v in dq_dict.get(c, ()):
+                # (c, v) is adjacent: not a non-adjacent candidate.  An
+                # exact entry whose partner was merged degrades to a bound.
+                if entry is not None and entry[2] and entry[1] in (u, v):
+                    na_set(c, entry[0], None, False)
+                continue
+            g = gain_na(c, v)
+            if stats is not None:
+                stats["greedy_na_gain_evals"] += 1
+            if entry is None:
+                # c had no non-adjacent candidate; v is its only one
+                na_set(c, g, v, True)
+            elif not entry[2]:
+                # stale entry: keep the larger upper bound
+                if g > entry[0]:
+                    na_set(c, g, None, False)
+            elif entry[1] in (u, v):
+                # c's best partner was just merged
+                if g >= entry[0]:
+                    na_set(c, g, v, True)
+                else:
+                    na_set(c, entry[0], None, False)
+            elif g > entry[0]:
+                # v becomes c's best non-adjacent partner
+                na_set(c, g, v, True)
+
+    # initial upper bounds: gain_na(c, d) <= a_neg * k_neg[c] * max_d k_neg[d]
+    kn_max = max(k_neg) if N else 0.0
+    for c in range(N):
+        na_set(c, a_neg * k_neg[c] * kn_max, None, False)
+
+    # Initialize single-node communities
+    yield communities.values()
+
+    # Merge the two communities that lead to the largest signed modularity
+    while len(communities) > 1:
+        # best adjacent pair (from the heap of row maxima)
+        best_dq = None
+        u = v = -1
+        if len(H) > 0:
+            row = H.heap[0].element
+            top = dq_heap[row].heap[0]
+            best_dq = -top.priority
+            u, v = row, top.element[1]
+        # best non-adjacent pair: stale upper bounds are resolved exactly
+        # only while they can still beat the adjacent best
+        while len(na_H) > 0:
+            top = na_H.heap[0]
+            c = top.element
+            entry = na_best[c]
+            if entry[2]:
+                # exact root: every other entry is bounded by it
+                g = entry[0]
+                if best_dq is None or g > best_dq:
+                    best_dq = g
+                    u, v = c, entry[1]
+                break
+            if best_dq is not None and -top.priority <= best_dq:
+                break  # no non-adjacent pair can beat the adjacent best
+            na_rescan(c)
+        if best_dq is None:
+            break
+        if not math.isfinite(best_dq):
+            raise ValueError(
+                "signed modularity gain overflowed the floating-point range"
+            )
+        yield best_dq
+        merge(u, v)
+        yield communities.values()
 
 
 @not_implemented_for("directed")

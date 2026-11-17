@@ -7,6 +7,7 @@ from itertools import combinations
 
 import networkx as nx
 from networkx import NetworkXError
+from networkx.algorithms.community._signed import _signed_modularity
 from networkx.algorithms.community.community_utils import is_partition
 from networkx.utils.decorators import argmap
 
@@ -142,7 +143,7 @@ def inter_community_non_edges(G, partition):
 
 
 @nx._dispatchable(edge_attrs="weight")
-def modularity(G, communities, weight="weight", resolution=1):
+def modularity(G, communities, weight="weight", resolution=1, *, signed=False):
     r"""Returns the modularity of the given partition of the graph.
 
     Modularity is defined in [1]_ as
@@ -176,6 +177,23 @@ def modularity(G, communities, weight="weight", resolution=1):
     The second formula is the one actually used in calculation of the modularity.
     For directed graphs the second formula replaces $k_c$ with $k^{in}_c k^{out}_c$.
 
+    With ``signed=True`` (undirected graphs only), edges with negative
+    weights are treated as evidence *against* communities following [6]_.
+    Each edge weight is split into a positive layer ($w^+ = \max(w, 0)$)
+    and a negative layer ($w^- = \max(-w, 0)$); zero weights contribute to
+    neither.  With $m^+$, $m^-$ the total edge mass of the two layers
+    (self-loops counted once) and $Q^+$, $Q^-$ the modularity above
+    computed on each layer separately (same `resolution`; self-loops count
+    twice in degrees), the signed modularity is
+
+    .. math::
+        Q_{signed} = \frac{m^+ Q^+ - m^- Q^-}{m^+ + m^-}
+
+    A layer without mass is omitted from the formula; if both layers are
+    empty the score is 0.  Graphs with only positive weights degenerate to
+    the usual modularity.  Signed mode requires finite, non-bool real
+    weights and a finite non-negative resolution.
+
     Parameters
     ----------
     G : NetworkX Graph
@@ -192,6 +210,11 @@ def modularity(G, communities, weight="weight", resolution=1):
         If resolution is less than 1, modularity favors larger communities.
         Greater than 1 favors smaller communities.
 
+    signed : bool, optional (default=False)
+        If True, use the signed two-layer modularity described above,
+        treating negative edge weights as repulsive. Only implemented for
+        undirected graphs.
+
     Returns
     -------
     Q : float
@@ -202,6 +225,15 @@ def modularity(G, communities, weight="weight", resolution=1):
     NotAPartition
         If `communities` is not a partition of the nodes of `G`.
 
+    NetworkXNotImplemented
+        If `signed` is True and `G` is directed.
+
+    ValueError
+        If `signed` is True and a weight or `resolution` is not a finite
+        real number (weights must also not be boolean), if `resolution`
+        is negative, or if an accumulated layer mass overflows the
+        floating-point range.
+
     Examples
     --------
     >>> G = nx.barbell_graph(3, 0)
@@ -209,6 +241,12 @@ def modularity(G, communities, weight="weight", resolution=1):
     0.35714285714285715
     >>> nx.community.modularity(G, nx.community.label_propagation_communities(G))
     0.35714285714285715
+
+    >>> G = nx.Graph()
+    >>> G.add_edge(0, 1, weight=2)  # support
+    >>> G.add_edge(1, 2, weight=-1)  # rejection
+    >>> nx.community.modularity(G, [{0, 1}, {2}], signed=True)
+    0.16666666666666666
 
     References
     ----------
@@ -225,11 +263,16 @@ def modularity(G, communities, weight="weight", resolution=1):
     .. [5] Blondel, V.D. et al. "Fast unfolding of communities in large
        networks" J. Stat. Mech 10008, 1-12 (2008).
        https://doi.org/10.1088/1742-5468/2008/10/P10008
+    .. [6] Gómez, S., Jensen, P. & Arenas, A. "Analysis of community
+       structure in networks of correlated data". Phys. Rev. E 80, 016114
+       (2009). https://doi.org/10.1103/PhysRevE.80.016114
     """
     if not isinstance(communities, list):
         communities = list(communities)
     if not is_partition(G, communities):
         raise NotAPartition(G, communities)
+    if signed:
+        return _signed_modularity(G, communities, weight, resolution)
 
     directed = G.is_directed()
     if directed:
