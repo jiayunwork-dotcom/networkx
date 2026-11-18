@@ -107,7 +107,10 @@ def louvain_communities(
         undirected graphs. Node moves then consider every community (not
         only neighboring ones) as well as the possibility of the node
         forming a singleton community, and a move is only performed when
-        its gain exceeds 1e-12.
+        its gain exceeds 1e-12.  The internal arithmetic is normalized by
+        an exact power of two, so the result is well defined across the
+        whole finite float64 weight range (see
+        :func:`~networkx.algorithms.community.quality.modularity`).
 
     Returns
     -------
@@ -430,7 +433,11 @@ def _louvain_partitions_signed(G, weight, resolution, threshold, seed):
     if nx.is_empty(G):
         yield partition
         return
-    graph, m_pos, m_neg = _signed_layer_graph(G, weight)
+    # The layer graph, masses and every gain below live in the same
+    # normalized space (see _signed module docstring), so degree products
+    # and reciprocal masses never overflow or underflow for any graph
+    # whose raw weights and layer masses are finite float64 values.
+    graph, m_pos, m_neg, _weight_exp = _signed_layer_graph(G, weight)
     if m_pos + m_neg == 0:
         # No mass in either layer: every partition scores 0, no move can
         # improve it, so the singleton partition is already optimal.

@@ -194,6 +194,15 @@ def modularity(G, communities, weight="weight", resolution=1, *, signed=False):
     the usual modularity.  Signed mode requires finite, non-bool real
     weights and a finite non-negative resolution.
 
+    The signed score is invariant under multiplying every edge weight by
+    the same positive constant.  Internally the weights are rescaled by an
+    exact power of two into a common normalized space before any degree
+    products or divisions, so scores and optimizer decisions stay correct
+    whenever every per-edge weight, the two layer masses and their total
+    are representable as finite float64 values (scales from the smallest
+    subnormals up to roughly 1e308).  Accumulating a layer mass that would
+    overflow float64 still raises :exc:`ValueError`.
+
     Parameters
     ----------
     G : NetworkX Graph

@@ -475,7 +475,7 @@ class TestSignedLouvain:
         rng = random.Random(15)
         for trial in range(8):
             G = random_signed_graph(rng, rng.randint(4, 14), selfloop_p=0.1)
-            H, m_pos, m_neg = _signed_layer_graph(G, "weight")
+            H, m_pos, m_neg, _ = _signed_layer_graph(G, "weight")
             if m_pos + m_neg == 0:
                 continue
             edges = layer_edges(H)
@@ -524,7 +524,7 @@ class TestSignedLouvain:
         rng = random.Random(16)
         for _ in range(10):
             G = random_signed_graph(rng, rng.randint(4, 14), selfloop_p=0.1)
-            H, m_pos, m_neg = _signed_layer_graph(G, "weight")
+            H, m_pos, m_neg, _ = _signed_layer_graph(G, "weight")
             if m_pos + m_neg == 0:
                 continue
             part = random_partition(rng, G)
@@ -659,9 +659,9 @@ class TestSignedLouvain:
 class TestSignedGreedy:
     def drive_generator(self, G, resolution=1.0):
         """Run the signed generator, checking every step against reference."""
-        m_pos, m_neg, deg_pos, deg_neg = _signed_layer_data(G, "weight")
+        m_pos, m_neg, deg_pos, deg_neg, weight_exp = _signed_layer_data(G, "weight")
         gen = _greedy_modularity_signed_generator(
-            G, "weight", resolution, m_pos, m_neg, deg_pos, deg_neg
+            G, "weight", resolution, m_pos, m_neg, deg_pos, deg_neg, weight_exp
         )
         communities = [set(c) for c in next(gen)]
         score = reference_signed_modularity(G, communities, resolution=resolution)

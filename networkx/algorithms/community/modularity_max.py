@@ -292,7 +292,11 @@ def greedy_modularity_communities(
         merge candidate -- including pairs with no edges between them,
         which can still have positive gain -- and merging stops when no
         merge gain exceeds 1e-12 (unless `best_n` forces it to continue,
-        in which case the largest-gain merge is still chosen).
+        in which case the largest-gain merge is still chosen).  The
+        internal arithmetic is normalized by an exact power of two, so
+        the merge sequence is well defined across the whole finite
+        float64 weight range (see
+        :func:`~networkx.algorithms.community.quality.modularity`).
 
     Raises
     ------
@@ -408,15 +412,18 @@ def _greedy_modularity_signed(G, weight, resolution, cutoff, best_n):
     else:
         best_n = N
 
-    # validate all weights and accumulate the two layer masses/degrees
-    m_pos, m_neg, deg_pos, deg_neg = _signed_layer_data(G, weight)
+    # validate all weights and accumulate the two layer masses/degrees;
+    # everything is expressed in the shared normalized space so that the
+    # gain products stay inside the ordinary float64 range regardless of
+    # the raw weight magnitudes
+    m_pos, m_neg, deg_pos, deg_neg, weight_exp = _signed_layer_data(G, weight)
 
     if best_n == 1:
         return [set(G)]
 
     # retrieve generator object to construct output
     community_gen = _greedy_modularity_signed_generator(
-        G, weight, resolution, m_pos, m_neg, deg_pos, deg_neg
+        G, weight, resolution, m_pos, m_neg, deg_pos, deg_neg, weight_exp
     )
 
     # construct the first best community
@@ -441,7 +448,7 @@ def _greedy_modularity_signed(G, weight, resolution, cutoff, best_n):
 
 
 def _greedy_modularity_signed_generator(
-    G, weight, resolution, m_pos, m_neg, deg_pos, deg_neg
+    G, weight, resolution, m_pos, m_neg, deg_pos, deg_neg, weight_exp
 ):
     r"""Yield partitions and signed-modularity changes at each merge step.
 
@@ -508,12 +515,14 @@ def _greedy_modularity_signed_generator(
 
     # net weight per adjacent community pair (both directions); the two
     # layers enter the gain through this net weight and, separately,
-    # through the layer degrees and masses above
+    # through the layer degrees and masses above.  Edge weights are
+    # scaled into the shared normalized space (exact power-of-two
+    # rescaling) so that the gain products stay in the float64 range.
     dq_dict = defaultdict(lambda: defaultdict(float))
     for u, v, w in G.edges(data=weight, default=1):
         if u == v:
             continue
-        w = float(w)  # already validated by _signed_layer_data
+        w = math.ldexp(float(w), -weight_exp)  # validated by _signed_layer_data
         if w == 0:
             continue
         i, j = node_idx[u], node_idx[v]

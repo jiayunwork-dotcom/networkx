@@ -1,0 +1,13 @@
+networkx.algorithms.community.tests.test_asyn_fluid
+networkx.algorithms.community.tests.test_centrality
+networkx.algorithms.community.tests.test_divisive
+networkx.algorithms.community.tests.test_kclique
+networkx.algorithms.community.tests.test_kernighan_lin
+networkx.algorithms.community.tests.test_label_propagation
+networkx.algorithms.community.tests.test_louvain
+networkx.algorithms.community.tests.test_lukes
+networkx.algorithms.community.tests.test_modularity_max
+networkx.algorithms.community.tests.test_quality
+networkx.algorithms.community.tests.test_signed
+networkx.algorithms.community.tests.test_signed_numeric_range
+networkx.algorithms.community.tests.test_utils

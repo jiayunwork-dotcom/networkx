@@ -34,6 +34,28 @@ negative weights are preserved through Louvain's graph compression, so
 the score of any partition of a compressed graph equals the score of
 the corresponding partition of the original graph.
 
+Numerical range
+---------------
+The signed score and every merge/move gain are homogeneous of degree
+zero in the edge weights: multiplying every weight by the same positive
+constant leaves them unchanged.  Working directly with weights of very
+different magnitudes nevertheless makes the intermediate products of
+the degree terms (squares of degrees, divisions by the total mass)
+overflow to infinity or underflow to zero, which silently corrupts the
+gains and the score.
+
+All internal arithmetic therefore runs in a *normalized* space.  A
+single binary exponent ``weight_exp`` is derived from the largest
+absolute edge weight, and every weight is scaled by a power of two
+(``math.ldexp``, an exact operation with no rounding) into a range whose
+largest magnitude does not exceed 1.  Layer masses, degrees, compressed
+graphs and gains are then all kept in normalized units, where every
+relevant product stays inside the ordinary float64 range as long as the
+raw per-edge weights, the raw layer masses and the raw total mass are
+finite float64 values.  Raw-scale masses that cannot be represented
+(their normalized values reconstruct to infinity) still raise
+:exc:`ValueError`.
+
 Benchmarking hook
 -----------------
 The module-level variable ``_EVAL_STATS`` may be set to a mutable
@@ -106,57 +128,115 @@ def _validate_signed_resolution(resolution):
     return resolution
 
 
-def _signed_layer_data(G, weight):
+def _max_weight_exp(G, weight):
+    """Return a normalization exponent for the edges of ``G``.
+
+    Every finite edge weight is validated.  The returned integer
+    ``weight_exp`` is chosen so that ``math.ldexp(abs(w), -weight_exp)``
+    is at most 1 for every edge weight ``w`` (the largest magnitude maps
+    into ``(0.5, 1]``); it is 0 when the graph has no nonzero edge.
+
+    Scaling by a power of two is exact in binary floating point, so
+    normalizing the weights neither rounds nor reorders their
+    significands.
+    """
+    weight_exp = None
+    for _, _, w in G.edges(data=weight, default=1):
+        w = _validate_signed_weight(w)
+        if w != 0.0:
+            exp = math.frexp(w)[1] - 1  # ldexp(abs(w), -exp) <= 1
+            if weight_exp is None or exp > weight_exp:
+                weight_exp = exp
+    return 0 if weight_exp is None else weight_exp
+
+
+def _normalize_weight(w, weight_exp):
+    """Scale a validated weight into the shared normalized space."""
+    return math.ldexp(w, -weight_exp)
+
+
+def _check_raw_mass(mass, weight_exp):
+    """Raise :class:`ValueError` if the raw-scale mass is not representable.
+
+    ``mass`` is a layer mass accumulated in the normalized space.  Its
+    raw-scale value is reconstructed exactly (up to the original
+    accumulation rounding) with a power-of-two rescaling; only an
+    infinite reconstruction means the genuinely accumulated raw mass
+    overflows the float64 range.
+    """
+    if not math.isfinite(mass):
+        raise ValueError(
+            "signed modularity total edge mass overflowed the floating-point range"
+        )
+    try:
+        raw_mass = math.ldexp(mass, weight_exp)
+    except OverflowError:
+        raise ValueError(
+            "signed modularity total edge mass overflowed the floating-point range"
+        ) from None
+    if not math.isfinite(raw_mass):
+        raise ValueError(
+            "signed modularity total edge mass overflowed the floating-point range"
+        )
+
+
+def _signed_layer_data(G, weight, weight_exp=None):
     """Split ``G`` into positive/negative degree and mass summaries.
 
-    Returns ``(m_pos, m_neg, deg_pos, deg_neg)`` where ``m_pos``/``m_neg``
-    are the total layer masses (self-loops counted once) and
-    ``deg_pos``/``deg_neg`` are dicts mapping each node to its
-    positive/negative weighted degree (self-loops counted twice, as usual
-    for undirected graphs).  Every edge weight is validated; a
+    Returns ``(m_pos, m_neg, deg_pos, deg_neg, weight_exp)`` where
+    ``m_pos``/``m_neg`` are the total layer masses (self-loops counted
+    once) and ``deg_pos``/``deg_neg`` are dicts mapping each node to its
+    positive/negative weighted degree (self-loops counted twice, as
+    usual for undirected graphs), all accumulated in the normalized
+    space defined by ``weight_exp``.  Every edge weight is validated; a
     :exc:`ValueError` is raised for invalid weights or if an accumulated
-    mass overflows the floating-point range.
+    mass is not representable in raw float64 scale.
     """
+    if weight_exp is None:
+        weight_exp = _max_weight_exp(G, weight)
     deg_pos = defaultdict(float)
     deg_neg = defaultdict(float)
     m_pos = 0.0
     m_neg = 0.0
     for u, v, w in G.edges(data=weight, default=1):
-        w = _validate_signed_weight(w)
+        w = _normalize_weight(_validate_signed_weight(w), weight_exp)
         if w > 0:
             m_pos += w
             deg_pos[u] += w
             deg_pos[v] += w
         elif w < 0:
-            m_neg -= w
-            deg_neg[u] -= w
-            deg_neg[v] -= w
+            w = -w
+            m_neg += w
+            deg_neg[u] += w
+            deg_neg[v] += w
         # zero weights contribute no mass to either layer
-    if not (math.isfinite(m_pos) and math.isfinite(m_neg)):
-        raise ValueError(
-            "signed modularity total edge mass overflowed the floating-point range"
-        )
-    return m_pos, m_neg, deg_pos, deg_neg
+    _check_raw_mass(m_pos, weight_exp)
+    _check_raw_mass(m_neg, weight_exp)
+    return m_pos, m_neg, deg_pos, deg_neg, weight_exp
 
 
-def _signed_layer_graph(G, weight):
+def _signed_layer_graph(G, weight, weight_exp=None):
     """Build a two-layer simple graph from ``G``.
 
-    Returns ``(H, m_pos, m_neg)`` where ``H`` is a :class:`nx.Graph` on the
-    same nodes whose edges carry the attributes ``"weight_pos"`` and
-    ``"weight_neg"``: the summed positive and (absolute) negative weights
-    of all parallel edges between the pair.  Both contributions are kept;
-    they are never netted against each other.  Pairs whose total
-    contribution is zero in both layers carry no information and are
-    dropped.  ``m_pos``/``m_neg`` are the total layer masses (self-loops
-    counted once), checked to be finite.
+    Returns ``(H, m_pos, m_neg, weight_exp)`` where ``H`` is a
+    :class:`nx.Graph` on the same nodes whose edges carry the attributes
+    ``"weight_pos"`` and ``"weight_neg"``: the summed positive and
+    (absolute) negative normalized weights of all parallel edges
+    between the pair.  Both contributions are kept; they are never
+    netted against each other.  Pairs whose total contribution is zero
+    in both layers carry no information and are dropped.
+    ``m_pos``/``m_neg`` are the total normalized layer masses
+    (self-loops counted once), checked to reconstruct to finite
+    raw-scale values.
     """
+    if weight_exp is None:
+        weight_exp = _max_weight_exp(G, weight)
     H = nx.Graph()
     H.add_nodes_from(G)
     m_pos = 0.0
     m_neg = 0.0
     for u, v, w in G.edges(data=weight, default=1):
-        w = _validate_signed_weight(w)
+        w = _normalize_weight(_validate_signed_weight(w), weight_exp)
         if w > 0:
             m_pos += w
             if H.has_edge(u, v):
@@ -164,17 +244,16 @@ def _signed_layer_graph(G, weight):
             else:
                 H.add_edge(u, v, weight_pos=w, weight_neg=0.0)
         elif w < 0:
-            m_neg -= w
+            w = -w
+            m_neg += w
             if H.has_edge(u, v):
-                H[u][v]["weight_neg"] -= w
+                H[u][v]["weight_neg"] += w
             else:
-                H.add_edge(u, v, weight_pos=0.0, weight_neg=-w)
+                H.add_edge(u, v, weight_pos=0.0, weight_neg=w)
         # zero weights contribute no mass to either layer
-    if not (math.isfinite(m_pos) and math.isfinite(m_neg)):
-        raise ValueError(
-            "signed modularity total edge mass overflowed the floating-point range"
-        )
-    return H, m_pos, m_neg
+    _check_raw_mass(m_pos, weight_exp)
+    _check_raw_mass(m_neg, weight_exp)
+    return H, m_pos, m_neg, weight_exp
 
 
 def _signed_modularity_value(m_pos, m_neg, resolution, stats):
@@ -184,9 +263,10 @@ def _signed_modularity_value(m_pos, m_neg, resolution, stats):
     one per community: ``L_pos``/``L_neg`` are the intra-community layer
     weights (each edge counted once) and ``K_pos``/``K_neg`` are the
     community sums of the layer degrees (self-loops counted twice).
-    ``m_pos``/``m_neg`` are the total layer masses.  This computes
-    ``(m_pos * Q_pos - m_neg * Q_neg) / (m_pos + m_neg)`` in the
-    algebraically equivalent "mass-weighted" form
+    ``m_pos``/``m_neg`` are the total layer masses.  All quantities must
+    use the same normalized space (see the module docstring).  This
+    computes ``(m_pos * Q_pos - m_neg * Q_neg) / (m_pos + m_neg)`` in
+    the algebraically equivalent "mass-weighted" form
 
         sum_c [L_pos_c - L_neg_c
                - gamma * K_pos_c^2 / (4 m_pos)
@@ -215,12 +295,14 @@ def _signed_modularity_value(m_pos, m_neg, resolution, stats):
 def _signed_modularity(G, communities, weight, resolution):
     """Signed modularity of a valid partition of an undirected graph.
 
-    This is a single pass over the edges of ``G``; it does not copy the
+    This is a single pass over the edges of ``G`` after the
+    normalization exponent has been determined; it does not copy the
     graph.  ``communities`` must be a valid partition (checked by the
     caller).  See the module docstring for the scoring convention.
     """
     _check_signed_graph(G)
     resolution = _validate_signed_resolution(resolution)
+    weight_exp = _max_weight_exp(G, weight)
     node2com = {}
     for i, community in enumerate(communities):
         for u in community:
@@ -233,7 +315,7 @@ def _signed_modularity(G, communities, weight, resolution):
     m_pos = 0.0
     m_neg = 0.0
     for u, v, w in G.edges(data=weight, default=1):
-        w = _validate_signed_weight(w)
+        w = _normalize_weight(_validate_signed_weight(w), weight_exp)
         if w > 0:
             m_pos += w
             deg_pos[u] += w
@@ -241,16 +323,15 @@ def _signed_modularity(G, communities, weight, resolution):
             if node2com[u] == node2com[v]:
                 L_pos[node2com[u]] += w
         elif w < 0:
-            m_neg -= w
-            deg_neg[u] -= w
-            deg_neg[v] -= w
+            w = -w
+            m_neg += w
+            deg_neg[u] += w
+            deg_neg[v] += w
             if node2com[u] == node2com[v]:
-                L_neg[node2com[u]] -= w
+                L_neg[node2com[u]] += w
         # zero weights contribute no mass to either layer
-    if not (math.isfinite(m_pos) and math.isfinite(m_neg)):
-        raise ValueError(
-            "signed modularity total edge mass overflowed the floating-point range"
-        )
+    _check_raw_mass(m_pos, weight_exp)
+    _check_raw_mass(m_neg, weight_exp)
     K_pos = [0.0] * n_com
     K_neg = [0.0] * n_com
     for u, c in node2com.items():
@@ -266,10 +347,11 @@ def _signed_modularity_reduced(G, communities, m_pos, m_neg, resolution):
 
     ``G`` is a graph built by :func:`_signed_layer_graph` (or compressed
     by ``_gen_graph_signed``) whose edges carry ``"weight_pos"`` and
-    ``"weight_neg"`` attributes; ``m_pos``/``m_neg`` are the (already
-    validated) total layer masses.  Because compression preserves both
-    layers and the masses, the result equals the signed modularity of
-    the corresponding partition of the original graph.
+    ``"weight_neg"`` attributes; ``m_pos``/``m_neg`` are the total
+    normalized layer masses.  Because compression preserves both layers
+    and the masses in the same normalized space, the result equals the
+    signed modularity of the corresponding partition of the original
+    graph.
     """
     node2com = {}
     for i, community in enumerate(communities):
